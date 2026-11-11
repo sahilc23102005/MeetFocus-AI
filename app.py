@@ -542,7 +542,9 @@ participantBox.dataset.participantName =
 
     // Add participant to Organizer Dashboard
 const overview = document.getElementById("participantOverview");
-overview.innerHTML = "";
+if (overview.textContent.includes("Waiting for participants to join...")) {
+    overview.innerHTML = "";
+}
 
 const overviewCard = document.createElement("div");
 overviewCard.style.padding = "12px";
