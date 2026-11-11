@@ -1,25 +1,31 @@
 import os
-import sqlite3
 from datetime import datetime
 from uuid import uuid4
 from urllib.parse import quote
 from html import escape
 
 import httpx
+import psycopg
+from psycopg.rows import dict_row
 from dotenv import load_dotenv
-from fastapi import FastAPI, Form, HTTPException
+from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 load_dotenv(override=True)
 
 app = FastAPI(title="MeetFocus AI")
-# SQLite Database Connection
-DB_NAME = "meetfocus.db"
+# PostgreSQL Database Connection
 
 def get_db_connection():
-    conn = sqlite3.connect(DB_NAME)
-    conn.row_factory = sqlite3.Row
-    return conn
+    database_url = os.getenv("DATABASE_URL")
+
+    if not database_url:
+        raise RuntimeError("DATABASE_URL is not configured.")
+
+    return psycopg.connect(
+        database_url,
+        row_factory=dict_row
+    )
 
 # Create Database Tables
 def create_tables():
@@ -37,7 +43,7 @@ def create_tables():
     # Participants Table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS participants (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+           id BIGSERIAL PRIMARY KEY,
             meeting_id TEXT,
             participant_name TEXT,
             face_visibility_score INTEGER DEFAULT 0,
@@ -53,8 +59,21 @@ def create_tables():
 
 create_tables()
 
+def meeting_exists(meeting_id: str) -> bool:
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        "SELECT meeting_id FROM meetings WHERE meeting_id = %s",
+        (meeting_id,)
+    )
+
+    meeting = cursor.fetchone()
+    conn.close()
+
+    return meeting is not None 
+
 # Temporary in-memory meeting storage. Meetings are cleared when the server restarts.
-meetings = {}
 
 LIVEKIT_SANDBOX_ID = "meetfocusai-1cuxq8"
 LIVEKIT_CONNECTION_DETAILS_URL = "https://cloud-api.livekit.io/api/sandbox/connection-details"
@@ -75,12 +94,17 @@ HOME_PAGE = """
             display: flex; align-items: center; justify-content: center;
             padding: 24px;
         }
-        .card {
+              .card {
             width: 100%; max-width: 620px; padding: 38px;
             background: #151d35; border: 1px solid #263653;
             border-radius: 20px; box-shadow: 0 18px 50px #0006;
         }
-        h1 { color: #67e8f9; margin: 0 0 10px; font-size: 34px; }
+
+        h1 {
+            color: #67e8f9;
+            margin: 0 0 10px;
+            font-size: 34px;
+        }
         .subtitle { color: #b8c5dc; margin-bottom: 30px; line-height: 1.5; }
         h2 { font-size: 19px; margin: 24px 0 12px; }
         input {
@@ -994,16 +1018,15 @@ async def home():
 @app.post("/create")
 async def create_meeting():
     meeting_id = uuid4().hex[:8]
-    meetings[meeting_id] = {"created": True}
-
-    # Save meeting in SQLite Database
+    
+    # Save meeting in PostgreSQL Database
     conn = get_db_connection()
     cursor = conn.cursor()
 
     cursor.execute(
-        "INSERT INTO meetings (meeting_id, created_at) VALUES (?, ?)",
-        (meeting_id, datetime.now().isoformat())
-    )
+    "INSERT INTO meetings (meeting_id, created_at) VALUES (%s, %s)",
+    (meeting_id, datetime.now().isoformat())
+)
 
     conn.commit()
     conn.close()
@@ -1015,31 +1038,47 @@ async def create_meeting():
 
 
 
+
 @app.get("/join")
 async def join_meeting(meeting_id: str):
     meeting_id = meeting_id.strip()
+
     if not meeting_id:
-        raise HTTPException(status_code=400, detail="Meeting ID is required.")
-    if meeting_id not in meetings:
+        raise HTTPException(
+            status_code=400,
+            detail="Meeting ID is required."
+        )
+
+    if not meeting_exists(meeting_id):
         raise HTTPException(
             status_code=404,
             detail="Meeting ID not found. Ask the host to create a new meeting link."
         )
-    return RedirectResponse(url=f"/meeting/{quote(meeting_id)}?role=participant", status_code=303)
+
+    return RedirectResponse(
+        url=f"/meeting/{quote(meeting_id)}?role=participant",
+        status_code=303
+    )
+
+
 
 
 @app.get("/meeting/{meeting_id}", response_class=HTMLResponse)
-async def meeting_page(meeting_id: str):
-    if meeting_id not in meetings:
+async def meeting_page(meeting_id: str, request: Request):
+    if not meeting_exists(meeting_id):
         raise HTTPException(
             status_code=404,
             detail="Meeting not found. Please create a new meeting from the home page."
         )
 
-    meeting_link = f"http://127.0.0.1:8001/join?meeting_id={quote(meeting_id)}"
+    base_url = str(request.base_url).rstrip("/")
+    meeting_link = f"{base_url}/join?meeting_id={quote(meeting_id)}"
+
     page = MEETING_PAGE.replace("__MEETING_ID__", escape(meeting_id))
     page = page.replace("__MEETING_LINK__", escape(meeting_link))
+
     return HTMLResponse(page)
+
 
 
 @app.get("/get-token")
@@ -1047,10 +1086,14 @@ async def get_token(meeting_id: str, participant_name: str = "Participant"):
     meeting_id = meeting_id.strip()
     participant_name = participant_name.strip() or "Participant"
 
-    if meeting_id not in meetings:
-        raise HTTPException(status_code=404, detail="Meeting ID not found.")
+    if not meeting_exists(meeting_id):
+        raise HTTPException(
+            status_code=404,
+            detail="Meeting ID not found."
+        )
 
     headers = {"X-Sandbox-ID": LIVEKIT_SANDBOX_ID}
+
     payload = {
         "room_name": meeting_id,
         "participant_name": participant_name
@@ -1071,6 +1114,7 @@ async def get_token(meeting_id: str, participant_name: str = "Participant"):
             )
 
         result = response.json()
+
         server_url = result.get("serverUrl") or result.get("server_url")
         token = result.get("participantToken") or result.get("participant_token")
         returned_name = result.get("participantName") or participant_name
@@ -1081,7 +1125,7 @@ async def get_token(meeting_id: str, participant_name: str = "Participant"):
                 detail="LiveKit response did not contain serverUrl and participantToken."
             )
 
-                # Save Participant in SQLite Database
+        # Save Participant in PostgreSQL Database
         conn = get_db_connection()
         cursor = conn.cursor()
 
@@ -1089,7 +1133,7 @@ async def get_token(meeting_id: str, participant_name: str = "Participant"):
             """
             INSERT INTO participants
             (meeting_id, participant_name, joined_at)
-            VALUES (?, ?, ?)
+            VALUES (%s, %s, %s)
             """,
             (meeting_id, returned_name, datetime.now().isoformat())
         )
@@ -1108,6 +1152,7 @@ async def get_token(meeting_id: str, participant_name: str = "Participant"):
             status_code=502,
             detail=f"Could not contact LiveKit sandbox: {str(error)}"
         )
+
 
     
 @app.post("/save-score")
@@ -1129,11 +1174,11 @@ async def save_score(
     cursor.execute(
         """
         UPDATE participants
-        SET face_visibility_score = ?,
-            screen_facing_score = ?
-        WHERE id = (
+                SET face_visibility_score = %s,
+            screen_facing_score = %s
+                    WHERE id = (
             SELECT id FROM participants
-            WHERE meeting_id = ? AND participant_name = ?
+            WHERE meeting_id = %s AND participant_name = %s
             ORDER BY id DESC
             LIMIT 1
         )
