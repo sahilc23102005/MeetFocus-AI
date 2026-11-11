@@ -2,3 +2,4 @@
 uvicorn[standard]
 python-dotenv
 httpx
+psycopg[binary]
